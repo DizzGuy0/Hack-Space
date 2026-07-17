@@ -18,6 +18,7 @@ ID never appears in any outbound text; raw transcript survives LLM failures.
 """
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -46,6 +47,8 @@ AT_LOG = os.environ.get("AIRTABLE_LOG_TABLE", "Log Entries")
 AT_ROSTER = os.environ.get("AIRTABLE_ROSTER_TABLE", "Roster")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 SELF_PING = os.environ.get("SELF_PING", "true").lower() == "true"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 CATEGORIES = [
     "Dock & Receiving", "Warehouse & Equipment", "Food Quality & Produce",
@@ -201,6 +204,22 @@ def send_message(to: str, body: str, whatsapp: bool):
     return r
 
 
+def send_telegram(chat_id, text):
+    r = requests.post(f"{TG_API}/sendMessage",
+                      json={"chat_id": chat_id, "text": text}, timeout=15)
+    if r.status_code >= 400:
+        log.error("Telegram send failed %s: %s", r.status_code, r.text[:300])
+    return r
+
+
+def send_any(to: str, body: str, whatsapp: bool = False):
+    """Route an outbound message by roster address: tg:<chat_id> or a phone number."""
+    if to.startswith("tg:"):
+        send_telegram(to[3:], body)
+    else:
+        send_message(to, body, whatsapp)
+
+
 def twiml_message(body: str) -> Response:
     xml = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response>"
            f"<Message>{escape(body)}</Message></Response>")
@@ -285,7 +304,7 @@ def handle_confirm(sender, whatsapp):
         for num in lead_numbers():
             if num == sender:
                 continue
-            send_message(num, f"URGENT log confirmed: {summary} Ask: {ask}", whatsapp)
+            send_any(num, f"URGENT log confirmed: {summary} Ask: {ask}", whatsapp)
             alerted += 1
         reply += (" On-duty lead alerted." if alerted
                   else " (High urgency — you are the on-duty lead on file.)")
@@ -378,6 +397,35 @@ def handle_lookup(query: str):
         lines.append(f"- [{date}] {f.get('summary')} Ask: {f.get('the_ask')}")
     return "\n".join(lines)
 
+# ---------------------------------------------------------------- dispatch
+
+def dispatch_text(sender: str, body: str, whatsapp: bool = False):
+    """Route one inbound text to the right flow. Returns reply text, or None
+    for silence. Channel-agnostic: used by the Twilio and Telegram webhooks."""
+    low = body.lower()
+    if low.startswith("/start"):
+        return ("OpsBrain ready. Send an observation (text or voice memo) to "
+                "log it, 'brief' for the daily brief, or 'find <keyword>' to "
+                "search past entries.")
+    if low in ("yes", "y", "yes."):
+        return handle_confirm(sender, whatsapp)
+    if low in ("no", "cancel", "discard"):
+        return handle_discard(sender)
+    if low in ("brief", "breif", "daily brief"):
+        return handle_brief()
+    for prefix in ("find ", "lookup ", "search "):
+        if low.startswith(prefix):
+            return handle_lookup(body[len(prefix):])
+    if low in ("find", "lookup", "search"):
+        return "Send: find <keyword>, e.g. find pallet jack"
+    if not body:
+        return None
+    pending = get_pending(sender)
+    if pending:
+        return handle_correction(sender, pending, body)
+    return handle_new_observation(sender, raw=body)
+
+
 # ---------------------------------------------------------------- webhooks
 
 _last_requests = deque(maxlen=10)
@@ -418,29 +466,51 @@ async def inbound_sms(request: Request):
                 sender, raw=None, audio=media.content,
                 audio_mime=form.get("MediaContentType0")))
 
-        low = body.lower()
-        if low in ("yes", "y", "yes."):
-            return twiml_message(handle_confirm(sender, whatsapp))
-        if low in ("no", "cancel", "discard"):
-            return twiml_message(handle_discard(sender))
-        if low in ("brief", "breif", "daily brief"):
-            return twiml_message(handle_brief())
-        for prefix in ("find ", "lookup ", "search "):
-            if low.startswith(prefix):
-                return twiml_message(handle_lookup(body[len(prefix):]))
-        if low in ("find", "lookup", "search"):
-            return twiml_message("Send: find <keyword>, e.g. find pallet jack")
-        if not body:
-            return twiml_empty()
-
-        pending = get_pending(sender)
-        if pending:
-            return twiml_message(handle_correction(sender, pending, body))
-        return twiml_message(handle_new_observation(sender, raw=body))
+        reply = dispatch_text(sender, body, whatsapp)
+        return twiml_message(reply) if reply else twiml_empty()
     except Exception:
         log.exception("inbound handling failed")
         return twiml_message("Something went wrong on our side — your message "
                              "was not saved. Please resend in a minute.")
+
+
+@app.post("/telegram")
+async def inbound_telegram(request: Request):
+    if not TELEGRAM_TOKEN:
+        return {"ok": True}
+    expected = hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()[:32]
+    if request.headers.get("x-telegram-bot-api-secret-token") != expected:
+        return {"ok": True}
+    update = await request.json()
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    if not chat_id:
+        return {"ok": True}
+    sender = f"tg:{chat_id}"
+    try:
+        if not is_allowed(sender):
+            log.info("ignored non-roster telegram chat")
+            return {"ok": True}
+        voice = msg.get("voice") or msg.get("audio")
+        if voice:
+            meta = requests.get(f"{TG_API}/getFile",
+                                params={"file_id": voice["file_id"]},
+                                timeout=15).json()
+            audio = requests.get(
+                f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/"
+                f"{meta['result']['file_path']}", timeout=30).content
+            reply = handle_new_observation(
+                sender, raw=None, audio=audio,
+                audio_mime=voice.get("mime_type") or "audio/ogg")
+        else:
+            reply = dispatch_text(sender, (msg.get("text") or "").strip())
+        if reply:
+            send_telegram(chat_id, reply)
+    except Exception:
+        log.exception("telegram handling failed")
+        send_telegram(chat_id, "Something went wrong on our side — your "
+                               "message was not saved. Please resend in a minute.")
+    return {"ok": True}
 
 
 @app.post("/voice")

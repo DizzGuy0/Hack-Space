@@ -379,9 +379,13 @@ def handle_lookup(query: str):
 
 # ---------------------------------------------------------------- webhooks
 
-@app.post("/sms")
+@app.api_route("/", methods=["GET", "POST"])
+@app.api_route("/sms", methods=["GET", "POST"])
 async def inbound_sms(request: Request):
-    form = await request.form()
+    # accept params however Twilio is configured to deliver them
+    form = dict(request.query_params)
+    if request.method == "POST":
+        form.update(await request.form())
     from_raw = form.get("From", "")
     whatsapp = from_raw.startswith("whatsapp:")
     sender = from_raw.removeprefix("whatsapp:")

@@ -232,7 +232,7 @@ def gemini_structure(text=None, audio_bytes=None, audio_mime=None,
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     headers={"x-goog-api-key": GEMINI_KEY,
                              "Content-Type": "application/json"},
-                    json=body, timeout=30)
+                    json=body, timeout=20)
             except requests.RequestException as exc:
                 last_err, r = exc, None
                 log.warning("model %s network error (%s), retrying", model, exc)
@@ -668,16 +668,33 @@ async def inbound_telegram(request: Request):
     chat_id = (msg.get("chat") or {}).get("id")
     if not chat_id:
         return {"ok": True}
+    uid = update.get("update_id")
+    if uid is not None and uid in _seen_updates:
+        return {"ok": True}          # Telegram retry of an update we have
+    _seen_updates.append(uid)
     sender = f"tg:{chat_id}"
     _last_requests.append({
         "t": now_iso(), "telegram_chat_id": chat_id,
         "from_name": (msg.get("from") or {}).get("first_name", ""),
         "text": (msg.get("text") or "[voice/media]")[:40],
     })
+    # ack immediately — the LLM round-trip is slower than Telegram's webhook
+    # timeout, and a slow response makes Telegram retry (duplicate messages)
+    threading.Thread(target=_process_telegram, args=(msg, chat_id, sender),
+                     daemon=True).start()
+    return {"ok": True}
+
+
+_seen_updates = deque(maxlen=300)
+
+
+def _process_telegram(msg, chat_id, sender):
     try:
         if not is_allowed(sender):
             log.info("ignored non-roster telegram chat %s", chat_id)
-            return {"ok": True}
+            return
+        requests.post(f"{TG_API}/sendChatAction",
+                      json={"chat_id": chat_id, "action": "typing"}, timeout=10)
         voice = msg.get("voice") or msg.get("audio")
         if voice:
             meta = requests.get(f"{TG_API}/getFile",
@@ -696,7 +713,6 @@ async def inbound_telegram(request: Request):
         log.exception("telegram handling failed")
         send_telegram(chat_id, "Something went wrong on our side — your "
                                "message was not saved. Please resend in a minute.")
-    return {"ok": True}
 
 
 @app.post("/voice")

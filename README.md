@@ -1,14 +1,21 @@
 # OpsBrain
 
-SMS/WhatsApp operational logging for food bank frontline staff (AISCO Hackathon,
-Theme 6 — "Every Team Member an Analyst", built for ACCFB's brief).
+Message-based operational logging for food bank frontline staff (AISCO
+Hackathon, Theme 6 — "Every Team Member an Analyst", built for ACCFB's brief).
 
-Any approved staff member texts (or sends a voice memo to) one number. The
+Any approved staff member sends a text or voice memo to one number/bot. The
 message is structured by one Gemini call into a fixed schema, confirmed by the
 sender before anything saves, and stored in Airtable. Leads text `brief` for a
 same-day digest; anyone approved texts `find <keyword>` to check whether
 something has been reported before. High-urgency confirmed entries alert the
 on-duty lead immediately.
+
+**Channels:** the backend is channel-agnostic. The live demo runs on a
+**Telegram bot** (free, no carrier registration). The same webhook handles
+Twilio SMS/WhatsApp unchanged — an adopting org registers a number with
+Twilio (~$2/month + A2P registration) and flips one webhook URL; no code
+changes. We verified the Twilio path end-to-end up to the point where trial
+accounts block free-form replies (carrier/trial policy, not code).
 
 ## Commands (from an approved phone)
 
@@ -54,26 +61,30 @@ Secrets live in `.env` (never commit it — `.gitignore` covers it).
    keeps the free instance awake (cold starts would exceed Twilio's 15s
    webhook timeout).
 
-## Wire up Twilio
+## Wire up a channel
 
-**WhatsApp sandbox (works today, free):** Console → Messaging → Try it out →
-Send a WhatsApp message → Sandbox settings → "When a message comes in" →
-`https://<your-url>/sms`. Every demo phone must first send the `join <code>`
-message shown on that page to the sandbox number.
+**Telegram (the live demo channel):** create a bot via @BotFather, set
+`TELEGRAM_BOT_TOKEN`, then point the bot's webhook at
+`https://<your-url>/telegram` (the deploy script's `setWebhook` call includes
+a secret token derived from the bot token). Staff are added to the Roster
+table as `tg:<chat_id>`.
 
-**Real SMS (later):** requires an upgraded Twilio account **and** toll-free
-verification of the 833 number (carrier requirement). Then set the number's
-Messaging webhook to `/sms` and Voice webhook to `/voice`. The code handles
-both channels transparently.
+**Twilio SMS/WhatsApp (production path):** upgrade the Twilio account,
+complete A2P/toll-free registration for the number, then set the number's
+Messaging webhook to `https://<your-url>/sms` and Voice webhook to `/voice`.
+The code already handles both channels — trial accounts can't deliver
+free-form replies, which is why the demo uses Telegram.
 
-## Demo script
+## Demo script (Telegram)
 
-1. Text a new observation → show the confirmation → reply `YES` → show the row
-   flip to `confirmed` in Airtable.
-2. Text `brief` → digest surfaces the pallet-jack pattern (seeded 3×).
-3. Text `find pallet jack` → three matching entries.
-4. Text `find tofu` → exactly "No matching entries."
-5. Text something high-urgency → `YES` → lead phone gets the alert.
+1. Show the Airtable base — this is the data steward's whole "admin UI."
+2. Send a voice memo or text observation → show the confirmation → reply
+   `YES` → show the row flip to `confirmed` in Airtable.
+3. Send `brief` → digest surfaces the pallet-jack pattern (seeded 3×).
+4. Send `find pallet jack` → three matching entries.
+5. Send `find tofu` → exactly "No matching entries."
+6. Invite a judge to message the bot from their phone → dead silence
+   (allowlist enforcement, live).
 
 ## Design decisions worth saying out loud
 

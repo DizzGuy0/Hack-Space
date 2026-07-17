@@ -490,6 +490,14 @@ def health():
     return {"ok": True, "service": "opsbrain"}
 
 
+# registered last: any other path (trailing slash, typo) still reaches the
+# message handler, so a slightly-off webhook URL in the Twilio console works
+@app.api_route("/{_path:path}", methods=["GET", "POST"])
+async def catch_all(request: Request):
+    log.info("webhook hit on non-standard path: %s", request.url.path)
+    return await inbound_sms(request)
+
+
 @app.on_event("startup")
 def start_self_ping():
     if not (SELF_PING and PUBLIC_BASE_URL):

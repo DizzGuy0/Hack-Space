@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -379,13 +380,24 @@ def handle_lookup(query: str):
 
 # ---------------------------------------------------------------- webhooks
 
+_last_requests = deque(maxlen=10)
+
+
 @app.api_route("/", methods=["GET", "POST"])
 @app.api_route("/sms", methods=["GET", "POST"])
 async def inbound_sms(request: Request):
     # accept params however Twilio is configured to deliver them
+    raw_body = await request.body()  # cached; form() below reuses it
     form = dict(request.query_params)
     if request.method == "POST":
         form.update(await request.form())
+    _last_requests.append({
+        "t": now_iso(), "method": request.method, "url": str(request.url),
+        "content_type": request.headers.get("content-type", ""),
+        "user_agent": request.headers.get("user-agent", ""),
+        "accept": request.headers.get("accept", ""),
+        "raw_body": raw_body[:1500].decode(errors="replace"),
+    })
     from_raw = form.get("From", "")
     whatsapp = from_raw.startswith("whatsapp:")
     sender = from_raw.removeprefix("whatsapp:")
@@ -488,6 +500,13 @@ async def voice_handle(request: Request):
 @app.get("/health")
 def health():
     return {"ok": True, "service": "opsbrain"}
+
+
+@app.get("/debug/last")
+def debug_last(key: str = ""):
+    if key != "opsbrain-dbg-7391":
+        return {"error": "missing key"}
+    return list(_last_requests)
 
 
 # registered last: any other path (trailing slash, typo) still reaches the

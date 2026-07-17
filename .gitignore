@@ -1,0 +1,6 @@
+# Secrets — .env.example is ignored too because it currently holds real credentials
+.env
+.env.example
+__pycache__/
+*.pyc
+.venv/

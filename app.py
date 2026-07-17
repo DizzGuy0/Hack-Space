@@ -41,6 +41,7 @@ TWILIO_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_SMS_FROM = os.environ["TWILIO_PHONE_NUMBER"]
 TWILIO_WA_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_KEY_BACKUP = os.environ.get("GEMINI_API_KEY_BACKUP", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 AT_KEY = os.environ["AIRTABLE_API_KEY"]
 AT_BASE = os.environ["AIRTABLE_BASE_ID"]
@@ -219,32 +220,40 @@ def gemini_structure(text=None, audio_bytes=None, audio_mime=None,
             "responseSchema": STRUCT_SCHEMA,
         },
     }
-    # primary model, then fallbacks — Gemini flash endpoints shed load under
-    # "high demand" spikes and a demo can't wait for them
+    # Each model family has its own free-tier quota bucket and the flash
+    # endpoints shed load under demand spikes, so walk models (and an optional
+    # backup key) until one answers. 429 = quota: skip ahead immediately.
     models = [GEMINI_MODEL] + [m for m in ("gemini-3-flash-preview",
-                                           "gemini-flash-latest")
+                                           "gemini-3.1-flash-lite",
+                                           "gemini-flash-lite-latest")
                                if m != GEMINI_MODEL]
+    keys = [GEMINI_KEY] + ([GEMINI_KEY_BACKUP] if GEMINI_KEY_BACKUP else [])
     r, last_err = None, None
-    for model in models:
-        for attempt in range(2):
-            try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers={"x-goog-api-key": GEMINI_KEY,
-                             "Content-Type": "application/json"},
-                    json=body, timeout=20)
-            except requests.RequestException as exc:
-                last_err, r = exc, None
-                log.warning("model %s network error (%s), retrying", model, exc)
-                continue
-            if r.status_code in (429, 500, 502, 503):
-                time.sleep(1.5)
-                continue
-            break
+    for key in keys:
+        for model in models:
+            for attempt in range(2):
+                try:
+                    r = requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        headers={"x-goog-api-key": key,
+                                 "Content-Type": "application/json"},
+                        json=body, timeout=20)
+                except requests.RequestException as exc:
+                    last_err, r = exc, None
+                    log.warning("model %s network error (%s), retrying", model, exc)
+                    continue
+                if r.status_code == 429:
+                    break
+                if r.status_code in (500, 502, 503):
+                    time.sleep(1.5)
+                    continue
+                break
+            if r is not None and r.status_code < 400:
+                break
+            log.warning("model %s unavailable (%s), trying next", model,
+                        r.status_code if r is not None else last_err)
         if r is not None and r.status_code < 400:
             break
-        log.warning("model %s unavailable (%s), trying next", model,
-                    r.status_code if r is not None else last_err)
     if r is None:
         raise RuntimeError(f"all Gemini models unreachable: {last_err}")
     r.raise_for_status()

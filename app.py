@@ -411,7 +411,7 @@ async def inbound_sms(request: Request):
             return twiml_message(handle_confirm(sender, whatsapp))
         if low in ("no", "cancel", "discard"):
             return twiml_message(handle_discard(sender))
-        if low == "brief":
+        if low in ("brief", "breif", "daily brief"):
             return twiml_message(handle_brief())
         for prefix in ("find ", "lookup ", "search "):
             if low.startswith(prefix):

@@ -61,6 +61,10 @@ SENSITIVE_REPLY = ("This sounds like something to raise directly with your "
                    "supervisor — please reach out to them.")
 NO_MATCH_REPLY = "No matching entries."
 
+TYPE_ICON = {"observation": "📝", "completion": "✅", "reminder": "⏰",
+             "knowledge": "📌"}
+URG_ICON = {"high": "🔴", "medium": "🟠", "low": "🟢"}
+
 log = logging.getLogger("opsbrain")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -367,13 +371,16 @@ def find_open_match(text):
 
 def confirmation_text(structured, resolves=None):
     kind = structured.get("entry_type") or "observation"
-    tag = {"completion": "completion", "reminder": "reminder",
-           "knowledge": "standing note"}.get(kind)
-    head = (f"Got it ({tag}): " if tag else "Got it: ") + structured["summary"]
+    lines = [f"{TYPE_ICON.get(kind, '📝')} {structured['summary']}"]
+    if structured.get("the_ask"):
+        lines.append(f"👉 {structured['the_ask']}")
+    lines.append(f"{URG_ICON.get(structured['urgency'], '')} "
+                 f"{structured['urgency']} · {structured['category']}")
     if resolves:
-        head += f" — this will mark as RESOLVED: \"{resolves}\""
-    return (f"{head} [{structured['category']} / {structured['urgency']}] "
-            f"Reply YES to save, NO to discard, or reply to correct.")
+        lines.append(f"🔗 Will close: “{resolves}”")
+    lines.append("")
+    lines.append("Save it? YES ✅ / NO ❌ — or reply with a fix")
+    return "\n".join(lines)
 
 
 def save_entry_and_reply(sender, raw_text, structured):
@@ -389,9 +396,11 @@ def save_entry_and_reply(sender, raw_text, structured):
     return confirmation_text(structured, resolves=resolves)
 
 
-USAGE_HINT = ("I keep the shift log. Tell me what you're seeing (e.g. \"pallet "
-              "jack 2 at dock 4 is down\"), ask \"what's the brief\", or "
-              "\"did anyone report the freezer?\"")
+USAGE_HINT = ("👋 I'm OpsBrain — the shift log.\n"
+              "📝 Tell me what you're seeing → I'll log it\n"
+              "📋 “What's the brief?” → today's rundown\n"
+              "🔎 “Did anyone report X?” → search past entries\n"
+              "🎙 Voice memos work too")
 
 
 def route_nl(sender, structured, raw_text, whatsapp, pending):
@@ -431,10 +440,11 @@ def handle_voice(sender, audio, audio_mime, whatsapp):
 def handle_confirm(sender, whatsapp):
     pending = get_pending(sender)
     if not pending:
-        return "Nothing waiting to confirm. Text an observation to log it."
+        return ("🤷 Nothing waiting to confirm. Just tell me what's happening "
+                "and I'll log it.")
     at_update(AT_LOG, pending["id"], {"status": "confirmed"})
     f = pending["fields"]
-    reply = f"Saved. Logged under {f.get('category', 'uncategorized')}."
+    reply = f"✅ Saved — {f.get('category', 'uncategorized')}."
 
     if f.get("entry_type") == "completion" and f.get("related_to"):
         try:
@@ -442,7 +452,7 @@ def handle_confirm(sender, whatsapp):
                 "status": "resolved",
                 "resolution_note": f"{now_iso()[:10]}: {f.get('summary', '')[:250]}",
             })
-            reply += " Linked case marked resolved."
+            reply += " 🔗 Linked case closed."
         except Exception:
             log.exception("resolving linked case failed")
 
@@ -460,21 +470,22 @@ def handle_confirm(sender, whatsapp):
         if (high and is_lead) or wants_cat:
             recipients.add(addr)
     for addr in recipients:
-        prefix = "URGENT " if high else ""
-        send_any(addr, f"OpsBrain {prefix}[{cat}]: {summary} Ask: {ask}", whatsapp)
+        head = "🚨 URGENT" if high else "📣 Heads-up"
+        send_any(addr, f"{head} · {cat}\n{TYPE_ICON.get(f.get('entry_type'), '📝')} "
+                       f"{summary}\n👉 {ask}", whatsapp)
     if recipients:
-        reply += f" Alerted {len(recipients)} teammate(s)."
+        reply += f" 📣 Alerted {len(recipients)} teammate(s)."
     elif high:
-        reply += " (High urgency — you are the on-duty lead on file.)"
+        reply += " 🔴 High urgency — you're the on-duty lead on file."
     return reply
 
 
 def handle_discard(sender):
     pending = get_pending(sender)
     if not pending:
-        return "Nothing waiting to confirm."
+        return "🤷 Nothing waiting to confirm."
     at_update(AT_LOG, pending["id"], {"status": "discarded"})
-    return "Discarded."
+    return "🗑 Discarded — nothing saved."
 
 
 def handle_correction(sender, pending, correction_text):
@@ -521,7 +532,7 @@ def handle_brief():
                  "IS_AFTER({timestamp}, DATEADD(NOW(), -72, 'hours')))"),
         max_records=10, sort_desc_by="timestamp")
     if not recs and not followups:
-        return "No confirmed entries in the last 24h."
+        return "📋 All quiet — no confirmed entries in the last 24h."
 
     def etype(f):
         return f.get("entry_type") or "observation"
@@ -535,24 +546,27 @@ def handle_brief():
             if f not in done and f not in know and f not in high
             and not f.get("follow_up")]
 
-    lines = [f"OpsBrain brief — {len(recs)} confirmed in last 24h"]
+    lines = [f"📋 Shift brief · {len(recs)} new in last 24h"]
     if high:
-        lines.append("HIGH:")
-        lines += [f"! {f.get('summary')} Ask: {f.get('the_ask')}" for f in high]
+        lines.append("\n🔴 Urgent:")
+        for f in high:
+            lines.append(f"• {f.get('summary')}")
+            if f.get("the_ask"):
+                lines.append(f"   👉 {f.get('the_ask')}")
     if followups:
-        lines.append("Check today:")
-        lines += [f"> {r['fields'].get('summary')}" for r in followups[:5]]
+        lines.append("\n⏰ Check today:")
+        lines += [f"• {r['fields'].get('summary')}" for r in followups[:5]]
     if done:
-        lines.append("Done:")
-        lines += [f"+ {f.get('summary')}" for f in done[:5]]
+        lines.append("\n✅ Done:")
+        lines += [f"• {f.get('summary')}" for f in done[:5]]
     if know:
-        lines.append("New standing notes:")
-        lines += [f"* {f.get('summary')}" for f in know[:5]]
+        lines.append("\n📌 New standing notes:")
+        lines += [f"• {f.get('summary')}" for f in know[:5]]
     if rest:
-        lines.append("Also logged:")
-        lines += [f"- [{f.get('category')}] {f.get('summary')}" for f in rest[:8]]
+        lines.append("\n🗒 Also logged:")
+        lines += [f"• {f.get('summary')} ({f.get('category')})" for f in rest[:8]]
         if len(rest) > 8:
-            lines.append(f"(+{len(rest) - 8} more in Airtable)")
+            lines.append(f"   …+{len(rest) - 8} more on the board")
     return "\n".join(lines)
 
 # ---------------------------------------------------------------- F3 lookup
@@ -575,11 +589,15 @@ def handle_lookup(query: str):
     if not scored:
         return NO_MATCH_REPLY
     scored.sort(key=lambda x: x[0], reverse=True)
-    lines = [f"{min(len(scored), 3)} of {len(scored)} matching entries:"]
+    lines = [f"🔎 Top {min(len(scored), 3)} of {len(scored)} matches:"]
     for _, f in scored[:3]:
-        date = (f.get("timestamp") or "")[:10]
-        mark = " (RESOLVED)" if f.get("status") == "resolved" else ""
-        lines.append(f"- [{date}] {f.get('summary')}{mark} Ask: {f.get('the_ask')}")
+        icon = ("✅" if f.get("status") == "resolved"
+                else TYPE_ICON.get(f.get("entry_type"), "📝"))
+        mark = " — resolved" if f.get("status") == "resolved" else ""
+        lines.append(f"{icon} {f.get('summary')}{mark} "
+                     f"({(f.get('timestamp') or '')[:10]})")
+        if f.get("the_ask") and f.get("status") != "resolved":
+            lines.append(f"   👉 {f.get('the_ask')}")
     return "\n".join(lines)
 
 # ---------------------------------------------------------------- dispatch

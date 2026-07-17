@@ -604,9 +604,14 @@ async def inbound_telegram(request: Request):
     if not chat_id:
         return {"ok": True}
     sender = f"tg:{chat_id}"
+    _last_requests.append({
+        "t": now_iso(), "telegram_chat_id": chat_id,
+        "from_name": (msg.get("from") or {}).get("first_name", ""),
+        "text": (msg.get("text") or "[voice/media]")[:40],
+    })
     try:
         if not is_allowed(sender):
-            log.info("ignored non-roster telegram chat")
+            log.info("ignored non-roster telegram chat %s", chat_id)
             return {"ok": True}
         voice = msg.get("voice") or msg.get("audio")
         if voice:

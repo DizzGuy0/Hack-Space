@@ -22,11 +22,19 @@ accounts block free-form replies (carrier/trial policy, not code).
 | You send | You get |
 |---|---|
 | any observation (text or voice memo) | "Got it: [summary]… Reply YES to save" |
-| `YES` | entry confirmed (+ lead alert if urgency high) |
+| "the pallet jack got fixed" | detected as a **completion** — on YES the matching open case is marked resolved |
+| "check the freezer seal in the morning" | detected as a **reminder** — surfaces under "Check today" in the brief |
+| "from next time everyone checks X" | detected as a **standing note** — joins the knowledge base, searchable forever |
+| `YES` | entry confirmed + routed: high urgency alerts leads; any category alerts roster members whose `alerts_for` includes it |
 | `NO` / `cancel` | pending entry discarded |
 | anything else while one is pending | treated as a correction, new confirmation |
-| `brief` | digest of confirmed entries, last 24h |
-| `find <keyword>` | up to 3 matching confirmed entries, or exactly "No matching entries." |
+| `brief` | sectioned digest: HIGH / Check today / Done / New standing notes / Also logged |
+| `find <keyword>` | up to 3 matching entries (resolved ones marked), or exactly "No matching entries." |
+
+**Ops Board:** `GET /dashboard` — a read-only status page (open cases, high
+urgency, category breakdown, follow-ups, standing notes, recent entries, team).
+No login, no caller IDs, refreshes every 60s. Routing rules (`alerts_for` per
+roster member) and all records are edited in Airtable by the data steward.
 
 Numbers not on the Roster table get **no response at all**.
 

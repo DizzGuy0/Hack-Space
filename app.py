@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -133,7 +134,13 @@ Rules:
 plain restatement of what needs attention — do not invent specifics.
 - sensitive_flag: true ONLY for safety violations against people, interpersonal \
 conflict, harassment, or HR-sensitive content. Broken equipment / trip hazards are \
-NOT sensitive; they are normal operational reports."""
+NOT sensitive; they are normal operational reports.
+- entry_type: "completion" if the sender reports something was finished, fixed, \
+or handled ("the pallet jack got repaired", "this got completed"). "reminder" if \
+they ask for something to be checked or done at a later time ("check this in the \
+morning"). "knowledge" if it is a standing instruction or practice going forward \
+("from next time everyone should check X"). Otherwise "observation".
+- follow_up: true if someone should check or verify something at a later time."""
 
 STRUCT_SCHEMA = {
     "type": "OBJECT",
@@ -145,9 +152,12 @@ STRUCT_SCHEMA = {
         "stated_impact": {"type": "STRING", "nullable": True},
         "the_ask": {"type": "STRING"},
         "sensitive_flag": {"type": "BOOLEAN"},
+        "entry_type": {"type": "STRING",
+                       "enum": ["observation", "completion", "reminder", "knowledge"]},
+        "follow_up": {"type": "BOOLEAN"},
     },
     "required": ["summary", "category", "urgency", "stated_impact",
-                 "the_ask", "sensitive_flag"],
+                 "the_ask", "sensitive_flag", "entry_type", "follow_up"],
 }
 
 
@@ -179,10 +189,34 @@ def gemini_structure(text=None, audio_bytes=None, audio_mime=None, correction=No
             "responseSchema": STRUCT_SCHEMA,
         },
     }
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
-        json=body, timeout=60)
+    # primary model, then fallbacks — Gemini flash endpoints shed load under
+    # "high demand" spikes and a demo can't wait for them
+    models = [GEMINI_MODEL] + [m for m in ("gemini-3-flash-preview",
+                                           "gemini-flash-latest")
+                               if m != GEMINI_MODEL]
+    r, last_err = None, None
+    for model in models:
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_KEY,
+                             "Content-Type": "application/json"},
+                    json=body, timeout=30)
+            except requests.RequestException as exc:
+                last_err, r = exc, None
+                log.warning("model %s network error (%s), retrying", model, exc)
+                continue
+            if r.status_code in (429, 500, 502, 503):
+                time.sleep(1.5)
+                continue
+            break
+        if r is not None and r.status_code < 400:
+            break
+        log.warning("model %s unavailable (%s), trying next", model,
+                    r.status_code if r is not None else last_err)
+    if r is None:
+        raise RuntimeError(f"all Gemini models unreachable: {last_err}")
     r.raise_for_status()
     cand = r.json()["candidates"][0]
     text_out = "".join(p.get("text", "") for p in cand["content"]["parts"]
@@ -244,7 +278,7 @@ def get_pending(sender: str):
     return recs[0] if recs else None
 
 
-def create_entry(sender, raw, structured=None, error_note=None):
+def create_entry(sender, raw, structured=None, error_note=None, related_to=None):
     fields = {
         "timestamp": now_iso(),
         "sender_phone": sender,
@@ -258,19 +292,48 @@ def create_entry(sender, raw, structured=None, error_note=None):
             urgency=structured["urgency"],
             the_ask=structured["the_ask"],
             sensitive_flag=bool(structured["sensitive_flag"]),
+            entry_type=structured.get("entry_type") or "observation",
+            follow_up=bool(structured.get("follow_up")),
         )
         if structured.get("stated_impact"):
             fields["stated_impact"] = structured["stated_impact"]
         if structured["sensitive_flag"]:
             fields["status"] = "sensitive_redirect"
+    if related_to:
+        fields["related_to"] = related_to
     if error_note:
         fields["error_note"] = error_note[:500]
     return at_create(AT_LOG, fields)
 
 
-def confirmation_text(structured):
-    return (f"Got it: {structured['summary']} "
-            f"[{structured['category']} / {structured['urgency']}] "
+def find_open_match(text):
+    """Best keyword match among open (confirmed, unresolved) entries, for
+    linking a completion report to the case it closes."""
+    words = {w for w in re.findall(r"[a-z0-9#]+", text.lower()) if len(w) >= 3}
+    if not words:
+        return None
+    recs = at_list(AT_LOG,
+                   formula="AND({status}='confirmed', {entry_type}!='knowledge')",
+                   max_records=100, sort_desc_by="timestamp")
+    best, best_score = None, 0
+    for r in recs:
+        f = r["fields"]
+        hay = " ".join([f.get("summary", ""), f.get("the_ask", ""),
+                        f.get("raw_transcript", "")]).lower()
+        score = sum(1 for w in words if w in hay)
+        if score > best_score:
+            best, best_score = r, score
+    return best if best_score >= 2 else None
+
+
+def confirmation_text(structured, resolves=None):
+    kind = structured.get("entry_type") or "observation"
+    tag = {"completion": "completion", "reminder": "reminder",
+           "knowledge": "standing note"}.get(kind)
+    head = (f"Got it ({tag}): " if tag else "Got it: ") + structured["summary"]
+    if resolves:
+        head += f" — this will mark as RESOLVED: \"{resolves}\""
+    return (f"{head} [{structured['category']} / {structured['urgency']}] "
             f"Reply YES to save, NO to discard, or reply to correct.")
 
 
@@ -285,10 +348,16 @@ def handle_new_observation(sender, raw, audio=None, audio_mime=None):
         return ("Couldn't auto-process that, but your note is saved for review "
                 "as-is. Reply YES to keep it, or resend.")
     raw_text = structured.get("transcript") or raw
-    create_entry(sender, raw_text, structured=structured)
+    related, resolves = None, None
+    if structured.get("entry_type") == "completion":
+        match = find_open_match(f"{structured['summary']} {raw_text}")
+        if match:
+            related = match["id"]
+            resolves = match["fields"].get("summary", "")
+    create_entry(sender, raw_text, structured=structured, related_to=related)
     if structured["sensitive_flag"]:
         return SENSITIVE_REPLY
-    return confirmation_text(structured)
+    return confirmation_text(structured, resolves=resolves)
 
 
 def handle_confirm(sender, whatsapp):
@@ -298,16 +367,37 @@ def handle_confirm(sender, whatsapp):
     at_update(AT_LOG, pending["id"], {"status": "confirmed"})
     f = pending["fields"]
     reply = f"Saved. Logged under {f.get('category', 'uncategorized')}."
-    if f.get("urgency") == "high":
-        summary, ask = f.get("summary", f.get("raw_transcript", "")), f.get("the_ask", "")
-        alerted = 0
-        for num in lead_numbers():
-            if num == sender:
-                continue
-            send_any(num, f"URGENT log confirmed: {summary} Ask: {ask}", whatsapp)
-            alerted += 1
-        reply += (" On-duty lead alerted." if alerted
-                  else " (High urgency — you are the on-duty lead on file.)")
+
+    if f.get("entry_type") == "completion" and f.get("related_to"):
+        try:
+            at_update(AT_LOG, f["related_to"], {
+                "status": "resolved",
+                "resolution_note": f"{now_iso()[:10]}: {f.get('summary', '')[:250]}",
+            })
+            reply += " Linked case marked resolved."
+        except Exception:
+            log.exception("resolving linked case failed")
+
+    # routing: high urgency -> active leads; any urgency -> roster members
+    # whose alerts_for includes the category (rules editable in Airtable)
+    summary = f.get("summary", f.get("raw_transcript", ""))
+    ask, cat, high = f.get("the_ask", ""), f.get("category", ""), f.get("urgency") == "high"
+    recipients = set()
+    for r in get_roster():
+        addr = r.get("phone_number")
+        if not (r.get("active") and addr) or addr == sender:
+            continue
+        is_lead = "lead" in (r.get("role") or "").lower()
+        wants_cat = bool(cat) and cat.lower() in (r.get("alerts_for") or "").lower()
+        if (high and is_lead) or wants_cat:
+            recipients.add(addr)
+    for addr in recipients:
+        prefix = "URGENT " if high else ""
+        send_any(addr, f"OpsBrain {prefix}[{cat}]: {summary} Ask: {ask}", whatsapp)
+    if recipients:
+        reply += f" Alerted {len(recipients)} teammate(s)."
+    elif high:
+        reply += " (High urgency — you are the on-duty lead on file.)"
     return reply
 
 
@@ -339,6 +429,8 @@ def handle_correction(sender, pending, correction_text):
         "the_ask": structured["the_ask"],
         "sensitive_flag": bool(structured["sensitive_flag"]),
         "stated_impact": structured.get("stated_impact") or "",
+        "entry_type": structured.get("entry_type") or "observation",
+        "follow_up": bool(structured.get("follow_up")),
     }
     if structured["sensitive_flag"]:
         fields["status"] = "sensitive_redirect"
@@ -355,19 +447,42 @@ def handle_brief():
         formula=("AND({status}='confirmed', "
                  "IS_AFTER({timestamp}, DATEADD(NOW(), -24, 'hours')))"),
         max_records=50, sort_desc_by="timestamp")
-    if not recs:
+    followups = at_list(
+        AT_LOG,
+        formula=("AND({status}='confirmed', {follow_up}=TRUE(), "
+                 "IS_AFTER({timestamp}, DATEADD(NOW(), -72, 'hours')))"),
+        max_records=10, sort_desc_by="timestamp")
+    if not recs and not followups:
         return "No confirmed entries in the last 24h."
-    high = [r["fields"] for r in recs if r["fields"].get("urgency") == "high"]
-    rest = [r["fields"] for r in recs if r["fields"].get("urgency") != "high"]
+
+    def etype(f):
+        return f.get("entry_type") or "observation"
+
+    fields = [r["fields"] for r in recs]
+    done = [f for f in fields if etype(f) == "completion"]
+    know = [f for f in fields if etype(f) == "knowledge"]
+    high = [f for f in fields
+            if f.get("urgency") == "high" and etype(f) not in ("completion", "knowledge")]
+    rest = [f for f in fields
+            if f not in done and f not in know and f not in high
+            and not f.get("follow_up")]
+
     lines = [f"OpsBrain brief — {len(recs)} confirmed in last 24h"]
     if high:
         lines.append("HIGH:")
-        for f in high:
-            lines.append(f"! {f.get('summary')} Ask: {f.get('the_ask')}")
+        lines += [f"! {f.get('summary')} Ask: {f.get('the_ask')}" for f in high]
+    if followups:
+        lines.append("Check today:")
+        lines += [f"> {r['fields'].get('summary')}" for r in followups[:5]]
+    if done:
+        lines.append("Done:")
+        lines += [f"+ {f.get('summary')}" for f in done[:5]]
+    if know:
+        lines.append("New standing notes:")
+        lines += [f"* {f.get('summary')}" for f in know[:5]]
     if rest:
         lines.append("Also logged:")
-        for f in rest[:8]:
-            lines.append(f"- [{f.get('category')}] {f.get('summary')}")
+        lines += [f"- [{f.get('category')}] {f.get('summary')}" for f in rest[:8]]
         if len(rest) > 8:
             lines.append(f"(+{len(rest) - 8} more in Airtable)")
     return "\n".join(lines)
@@ -378,7 +493,8 @@ def handle_lookup(query: str):
     words = [w for w in query.lower().split() if len(w) >= 3]
     if not words:
         return "Send: find <keyword>, e.g. find pallet jack"
-    recs = at_list(AT_LOG, formula="{status}='confirmed'",
+    recs = at_list(AT_LOG,
+                   formula="OR({status}='confirmed', {status}='resolved')",
                    max_records=100, sort_desc_by="timestamp")
     scored = []
     for r in recs:
@@ -394,7 +510,8 @@ def handle_lookup(query: str):
     lines = [f"{min(len(scored), 3)} of {len(scored)} matching entries:"]
     for _, f in scored[:3]:
         date = (f.get("timestamp") or "")[:10]
-        lines.append(f"- [{date}] {f.get('summary')} Ask: {f.get('the_ask')}")
+        mark = " (RESOLVED)" if f.get("status") == "resolved" else ""
+        lines.append(f"- [{date}] {f.get('summary')}{mark} Ask: {f.get('the_ask')}")
     return "\n".join(lines)
 
 # ---------------------------------------------------------------- dispatch
@@ -570,6 +687,145 @@ async def voice_handle(request: Request):
 @app.get("/health")
 def health():
     return {"ok": True, "service": "opsbrain"}
+
+
+DASH_CSS = """
+:root{color-scheme:light dark;
+  --bg:#f4f3f1;--surface:#fcfcfb;--border:#e5e4e0;--ink:#0b0b0b;--ink2:#52514e;
+  --accent:#2a78d6;--crit:#d03b3b;--warn:#8a5a00;--good:#0ca30c;
+  --crit-bg:#fbe9e9;--warn-bg:#fdf3d9;--good-bg:#e7f6e7;--chip:#eceae6}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#121211;--surface:#1a1a19;--border:#2c2b29;--ink:#ffffff;--ink2:#c3c2b7;
+  --accent:#3987e5;--crit:#e66767;--warn:#fab219;--good:#4dc44d;
+  --crit-bg:#3a2020;--warn-bg:#37310f;--good-bg:#1e3320;--chip:#26251f}}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,
+  "Segoe UI",sans-serif;padding:24px;max-width:1080px;margin:0 auto}
+h1{font-size:20px;font-weight:650}
+.sub{color:var(--ink2);font-size:13px;margin:2px 0 20px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:12px;margin-bottom:20px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:14px 16px}
+.tile .n{font-size:28px;font-weight:700;line-height:1.1}
+.tile .l{color:var(--ink2);font-size:12.5px;margin-top:2px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+@media(max-width:760px){.cols{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:16px}
+.card h2{font-size:13px;font-weight:650;text-transform:uppercase;
+  letter-spacing:.04em;color:var(--ink2);margin-bottom:10px}
+.item{padding:7px 0;border-top:1px solid var(--border);font-size:14px}
+.item:first-of-type{border-top:none}
+.item .meta{color:var(--ink2);font-size:12.5px}
+.chip{display:inline-block;border-radius:20px;padding:1px 9px;font-size:11.5px;
+  font-weight:600;background:var(--chip);color:var(--ink2)}
+.chip.high{background:var(--crit-bg);color:var(--crit)}
+.chip.medium{background:var(--warn-bg);color:var(--warn)}
+.chip.resolved{background:var(--good-bg);color:var(--good)}
+.bar-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;
+  padding:4px 0;font-size:13.5px}
+.bar-track{height:8px;border-radius:4px;background:var(--chip);margin-top:3px}
+.bar-fill{height:8px;border-radius:4px;background:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;color:var(--ink2);font-size:12px;text-transform:uppercase;
+  letter-spacing:.04em;font-weight:600;padding:6px 10px 6px 0}
+td{padding:7px 10px 7px 0;border-top:1px solid var(--border);vertical-align:top}
+.foot{color:var(--ink2);font-size:12.5px;margin-top:16px}
+"""
+
+
+def _days_ago(ts):
+    try:
+        d = (datetime.now(timezone.utc)
+             - datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
+        return "today" if d <= 0 else ("1d ago" if d == 1 else f"{d}d ago")
+    except Exception:
+        return ""
+
+
+@app.get("/dashboard")
+def dashboard():
+    recs = at_list(AT_LOG,
+                   formula="OR({status}='confirmed', {status}='resolved')",
+                   max_records=200, sort_desc_by="timestamp")
+    fields = [r["fields"] for r in recs]
+    roster = [r for r in get_roster() if r.get("active")]
+    e = escape
+
+    def etype(f):
+        return f.get("entry_type") or "observation"
+
+    open_f = [f for f in fields if f.get("status") == "confirmed"
+              and etype(f) not in ("completion", "knowledge")]
+    open_high = [f for f in open_f if f.get("urgency") == "high"]
+    resolved = [f for f in fields if f.get("status") == "resolved"]
+    follows = [f for f in open_f if f.get("follow_up")]
+    know = [f for f in fields if etype(f) == "knowledge"]
+
+    cats = {}
+    for f in open_f:
+        c = f.get("category") or "Other"
+        cats[c] = cats.get(c, 0) + 1
+    maxc = max(cats.values(), default=1)
+
+    def items(fs, empty, meta=lambda f: f.get("the_ask", "")):
+        if not fs:
+            return f'<div class="item meta" style="color:var(--ink2)">{empty}</div>'
+        return "".join(
+            f'<div class="item">{e(f.get("summary", ""))}'
+            f'<div class="meta">{e(meta(f) or "")} · {_days_ago(f.get("timestamp", ""))}</div></div>'
+            for f in fs[:6])
+
+    bars = "".join(
+        f'<div class="bar-row"><div>{e(c)}'
+        f'<div class="bar-track"><div class="bar-fill" style="width:{int(100 * n / maxc)}%"></div></div>'
+        f'</div><div>{n}</div></div>'
+        for c, n in sorted(cats.items(), key=lambda x: -x[1]))
+
+    team = "".join(
+        f'<div class="item">{e(r.get("name") or "—")}'
+        f'<div class="meta">{e(r.get("role") or "")}'
+        f'{" · alerts: " + e(r["alerts_for"]) if r.get("alerts_for") else ""}</div></div>'
+        for r in roster)
+
+    rows = "".join(
+        f'<tr><td>{_days_ago(f.get("timestamp", ""))}</td>'
+        f'<td>{e(etype(f))}</td><td>{e(f.get("category", ""))}</td>'
+        f'<td><span class="chip {e(f.get("urgency", ""))}">{e(f.get("urgency", "—"))}</span></td>'
+        f'<td>{e(f.get("summary", f.get("raw_transcript", ""))[:110])}</td>'
+        f'<td><span class="chip {e(f.get("status", ""))}">{e(f.get("status", ""))}</span></td></tr>'
+        for f in fields[:12])
+
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="60"><title>OpsBrain — Ops Board</title>
+<style>{DASH_CSS}</style></head><body>
+<h1>OpsBrain — Ops Board</h1>
+<div class="sub">Live from the field log · refreshes every 60s · read-only
+ (records &amp; routing rules are managed in Airtable)</div>
+<div class="tiles">
+ <div class="tile"><div class="n">{len(open_f)}</div><div class="l">Open cases</div></div>
+ <div class="tile"><div class="n">{len(open_high)}</div><div class="l">High urgency open</div></div>
+ <div class="tile"><div class="n">{len(resolved)}</div><div class="l">Resolved</div></div>
+ <div class="tile"><div class="n">{len(roster)}</div><div class="l">Active members</div></div>
+</div>
+<div class="cols">
+ <div class="card"><h2>High urgency — needs action</h2>{items(open_high, "Nothing urgent open.")}</div>
+ <div class="card"><h2>Open cases by category</h2>{bars or '<div class="item">No open cases.</div>'}</div>
+</div>
+<div class="cols">
+ <div class="card"><h2>Check today (follow-ups)</h2>{items(follows, "No follow-ups flagged.")}</div>
+ <div class="card"><h2>Standing notes (knowledge)</h2>{items(know, "None yet — texts like “from next time, everyone check X” land here.", meta=lambda f: f.get("category", ""))}</div>
+</div>
+<div class="card"><h2>Recent entries</h2>
+<div style="overflow-x:auto"><table>
+<tr><th>When</th><th>Type</th><th>Category</th><th>Urgency</th><th>Summary</th><th>Status</th></tr>
+{rows}</table></div></div>
+<div class="foot">Caller IDs are never shown. Roster &amp; routing (who gets
+ alerted per category) are edited by the data steward directly in Airtable.</div>
+</body></html>"""
+    return Response(content=html, media_type="text/html")
 
 
 @app.get("/debug/last")

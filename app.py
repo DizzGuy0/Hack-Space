@@ -121,10 +121,27 @@ def lead_numbers():
 
 # ---------------------------------------------------------------- Gemini
 
-STRUCTURE_RULES = f"""You structure observations reported by food bank frontline staff \
-(dock, receiving, warehouse, drivers) into a fixed schema.
+STRUCTURE_RULES = f"""You are OpsBrain, the message brain for a food bank's frontline \
+operations log. Staff (dock, receiving, warehouse, drivers) are non-technical and \
+write in casual natural language. First decide the INTENT of the message:
 
-Rules:
+- "log": they are reporting something — a problem, an observation, completed work, \
+a heads-up for the next shift, or a standing practice.
+- "brief": they are asking what's going on — a summary, the brief, "what happened \
+today", "anything I should know for this shift?".
+- "lookup": they are asking whether something was reported before, or searching \
+the log ("did anyone report the freezer?", "any issues with dock 2 lately?"). \
+Put the 2-4 most distinctive search words in lookup_query.
+- "confirm": they agree to save the pending entry (yes / yep / save it / correct).
+- "discard": they reject the pending entry (no / cancel / don't save / forget it).
+- "correction": ONLY if there is a pending entry AND they are adjusting its details.
+- "other": greetings, thanks, jokes, anything unrelated to the log.
+
+For intent "log", ALSO fill the entry fields per the rules below. For any other \
+intent set: summary "", category "Other", urgency "low", stated_impact null, \
+the_ask "", sensitive_flag false, entry_type "observation", follow_up false.
+
+Entry field rules:
 - summary: one plain-language sentence restating the observation. No embellishment.
 - category: one of {CATEGORIES}.
 - urgency: high only if it blocks operations or is a safety risk in the next ~48h.
@@ -137,14 +154,19 @@ conflict, harassment, or HR-sensitive content. Broken equipment / trip hazards a
 NOT sensitive; they are normal operational reports.
 - entry_type: "completion" if the sender reports something was finished, fixed, \
 or handled ("the pallet jack got repaired", "this got completed"). "reminder" if \
-they ask for something to be checked or done at a later time ("check this in the \
-morning"). "knowledge" if it is a standing instruction or practice going forward \
-("from next time everyone should check X"). Otherwise "observation".
+they ask for something to be checked or done at a later time or by the next shift \
+("check this in the morning"). "knowledge" if it is a standing instruction or \
+practice going forward ("from next time everyone should check X"). Otherwise \
+"observation".
 - follow_up: true if someone should check or verify something at a later time."""
 
 STRUCT_SCHEMA = {
     "type": "OBJECT",
     "properties": {
+        "intent": {"type": "STRING",
+                   "enum": ["log", "brief", "lookup", "confirm", "discard",
+                            "correction", "other"]},
+        "lookup_query": {"type": "STRING", "nullable": True},
         "transcript": {"type": "STRING"},
         "summary": {"type": "STRING"},
         "category": {"type": "STRING", "enum": CATEGORIES},
@@ -156,28 +178,36 @@ STRUCT_SCHEMA = {
                        "enum": ["observation", "completion", "reminder", "knowledge"]},
         "follow_up": {"type": "BOOLEAN"},
     },
-    "required": ["summary", "category", "urgency", "stated_impact",
-                 "the_ask", "sensitive_flag", "entry_type", "follow_up"],
+    "required": ["intent", "lookup_query", "summary", "category", "urgency",
+                 "stated_impact", "the_ask", "sensitive_flag", "entry_type",
+                 "follow_up"],
 }
 
 
-def gemini_structure(text=None, audio_bytes=None, audio_mime=None, correction=None):
-    """One structuring call. Returns dict per STRUCT_SCHEMA. Raises on failure."""
+def gemini_structure(text=None, audio_bytes=None, audio_mime=None,
+                     correction=None, pending_summary=None):
+    """One intent + structuring call. Returns dict per STRUCT_SCHEMA."""
+    if pending_summary:
+        ctx = (f"\n\nContext: this sender HAS a pending unconfirmed entry: "
+               f"\"{pending_summary}\" — confirm/discard/correction refer to it.")
+    else:
+        ctx = ("\n\nContext: this sender has NO pending entry, so confirm/"
+               "discard/correction do not apply; a report is intent \"log\".")
     parts = []
     if audio_bytes:
-        parts.append({"text": STRUCTURE_RULES +
+        parts.append({"text": STRUCTURE_RULES + ctx +
                       "\n\nFirst transcribe the attached voice memo verbatim into "
-                      "'transcript', then structure it."})
+                      "'transcript', then decide intent and structure it."})
         parts.append({"inline_data": {
             "mime_type": audio_mime or "audio/ogg",
             "data": base64.b64encode(audio_bytes).decode(),
         }})
     else:
-        prompt = STRUCTURE_RULES + f"\n\nTranscript: \"{text}\""
+        prompt = STRUCTURE_RULES + ctx + f"\n\nMessage: \"{text}\""
         if correction:
             prompt += (f"\n\nThe sender sent a correction to the above: "
-                       f"\"{correction}\". Re-structure taking the correction "
-                       f"as authoritative.")
+                       f"\"{correction}\". Intent is \"log\"; re-structure "
+                       f"taking the correction as authoritative.")
         parts.append({"text": prompt})
 
     body = {
@@ -337,17 +367,7 @@ def confirmation_text(structured, resolves=None):
             f"Reply YES to save, NO to discard, or reply to correct.")
 
 
-def handle_new_observation(sender, raw, audio=None, audio_mime=None):
-    try:
-        structured = gemini_structure(text=None if audio else raw,
-                                      audio_bytes=audio, audio_mime=audio_mime)
-    except Exception as e:
-        log.exception("structuring failed")
-        create_entry(sender, raw or "[voice memo — transcription failed]",
-                     error_note=f"structuring failed: {e}")
-        return ("Couldn't auto-process that, but your note is saved for review "
-                "as-is. Reply YES to keep it, or resend.")
-    raw_text = structured.get("transcript") or raw
+def save_entry_and_reply(sender, raw_text, structured):
     related, resolves = None, None
     if structured.get("entry_type") == "completion":
         match = find_open_match(f"{structured['summary']} {raw_text}")
@@ -358,6 +378,45 @@ def handle_new_observation(sender, raw, audio=None, audio_mime=None):
     if structured["sensitive_flag"]:
         return SENSITIVE_REPLY
     return confirmation_text(structured, resolves=resolves)
+
+
+USAGE_HINT = ("I keep the shift log. Tell me what you're seeing (e.g. \"pallet "
+              "jack 2 at dock 4 is down\"), ask \"what's the brief\", or "
+              "\"did anyone report the freezer?\"")
+
+
+def route_nl(sender, structured, raw_text, whatsapp, pending):
+    """Route a classified message to the right flow."""
+    intent = structured.get("intent") or "log"
+    if intent == "brief":
+        return handle_brief()
+    if intent == "lookup":
+        return handle_lookup(structured.get("lookup_query") or raw_text)
+    if intent == "confirm":
+        return handle_confirm(sender, whatsapp)
+    if intent == "discard":
+        return handle_discard(sender)
+    if intent == "correction" and pending:
+        return handle_correction(sender, pending, raw_text)
+    if intent == "log" or (intent == "correction" and not pending):
+        return save_entry_and_reply(sender, raw_text, structured)
+    return USAGE_HINT
+
+
+def handle_voice(sender, audio, audio_mime, whatsapp):
+    pending = get_pending(sender)
+    try:
+        structured = gemini_structure(
+            audio_bytes=audio, audio_mime=audio_mime,
+            pending_summary=pending["fields"].get("summary") if pending else None)
+    except Exception as e:
+        log.exception("voice structuring failed")
+        create_entry(sender, "[voice memo — transcription failed]",
+                     error_note=f"structuring failed: {e}")
+        return ("Couldn't process that voice memo — it's saved for review. "
+                "Reply YES to keep it, or try again.")
+    raw_text = structured.get("transcript") or "[voice memo]"
+    return route_nl(sender, structured, raw_text, whatsapp, pending)
 
 
 def handle_confirm(sender, whatsapp):
@@ -518,12 +577,12 @@ def handle_lookup(query: str):
 
 def dispatch_text(sender: str, body: str, whatsapp: bool = False):
     """Route one inbound text to the right flow. Returns reply text, or None
-    for silence. Channel-agnostic: used by the Twilio and Telegram webhooks."""
+    for silence. Channel-agnostic: used by the Twilio and Telegram webhooks.
+    Exact commands are instant fast-paths; everything else goes through the
+    natural-language intent classifier (one Gemini call)."""
     low = body.lower()
     if low.startswith("/start"):
-        return ("OpsBrain ready. Send an observation (text or voice memo) to "
-                "log it, 'brief' for the daily brief, or 'find <keyword>' to "
-                "search past entries.")
+        return "OpsBrain ready. " + USAGE_HINT
     if low in ("yes", "y", "yes."):
         return handle_confirm(sender, whatsapp)
     if low in ("no", "cancel", "discard"):
@@ -538,9 +597,16 @@ def dispatch_text(sender: str, body: str, whatsapp: bool = False):
     if not body:
         return None
     pending = get_pending(sender)
-    if pending:
-        return handle_correction(sender, pending, body)
-    return handle_new_observation(sender, raw=body)
+    try:
+        structured = gemini_structure(
+            text=body,
+            pending_summary=pending["fields"].get("summary") if pending else None)
+    except Exception as e:
+        log.exception("structuring failed")
+        create_entry(sender, body, error_note=f"structuring failed: {e}")
+        return ("Couldn't auto-process that, but your note is saved for review "
+                "as-is. Reply YES to keep it, or resend.")
+    return route_nl(sender, structured, body, whatsapp, pending)
 
 
 # ---------------------------------------------------------------- webhooks
@@ -579,9 +645,8 @@ async def inbound_sms(request: Request):
             media = requests.get(form["MediaUrl0"], auth=(TWILIO_SID, TWILIO_TOKEN),
                                  timeout=30)
             media.raise_for_status()
-            return twiml_message(handle_new_observation(
-                sender, raw=None, audio=media.content,
-                audio_mime=form.get("MediaContentType0")))
+            return twiml_message(handle_voice(
+                sender, media.content, form.get("MediaContentType0"), whatsapp))
 
         reply = dispatch_text(sender, body, whatsapp)
         return twiml_message(reply) if reply else twiml_empty()
@@ -621,9 +686,8 @@ async def inbound_telegram(request: Request):
             audio = requests.get(
                 f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/"
                 f"{meta['result']['file_path']}", timeout=30).content
-            reply = handle_new_observation(
-                sender, raw=None, audio=audio,
-                audio_mime=voice.get("mime_type") or "audio/ogg")
+            reply = handle_voice(
+                sender, audio, voice.get("mime_type") or "audio/ogg", False)
         else:
             reply = dispatch_text(sender, (msg.get("text") or "").strip())
         if reply:
@@ -671,8 +735,7 @@ async def voice_handle(request: Request):
                 time.sleep(2)
             if audio is None:
                 raise RuntimeError("recording not retrievable")
-            reply = handle_new_observation(sender, raw=None, audio=audio,
-                                           audio_mime="audio/mpeg")
+            reply = handle_voice(sender, audio, "audio/mpeg", False)
             send_message(sender, reply, whatsapp=False)
             # retention: don't keep raw audio around once transcribed
             if form.get("RecordingSid"):
@@ -694,143 +757,39 @@ def health():
     return {"ok": True, "service": "opsbrain"}
 
 
-DASH_CSS = """
-:root{color-scheme:light dark;
-  --bg:#f4f3f1;--surface:#fcfcfb;--border:#e5e4e0;--ink:#0b0b0b;--ink2:#52514e;
-  --accent:#2a78d6;--crit:#d03b3b;--warn:#8a5a00;--good:#0ca30c;
-  --crit-bg:#fbe9e9;--warn-bg:#fdf3d9;--good-bg:#e7f6e7;--chip:#eceae6}
-@media (prefers-color-scheme:dark){:root{
-  --bg:#121211;--surface:#1a1a19;--border:#2c2b29;--ink:#ffffff;--ink2:#c3c2b7;
-  --accent:#3987e5;--crit:#e66767;--warn:#fab219;--good:#4dc44d;
-  --crit-bg:#3a2020;--warn-bg:#37310f;--good-bg:#1e3320;--chip:#26251f}}
-*{box-sizing:border-box;margin:0}
-body{background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,
-  "Segoe UI",sans-serif;padding:24px;max-width:1080px;margin:0 auto}
-h1{font-size:20px;font-weight:650}
-.sub{color:var(--ink2);font-size:13px;margin:2px 0 20px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-  gap:12px;margin-bottom:20px}
-.tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;
-  padding:14px 16px}
-.tile .n{font-size:28px;font-weight:700;line-height:1.1}
-.tile .l{color:var(--ink2);font-size:12.5px;margin-top:2px}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
-@media(max-width:760px){.cols{grid-template-columns:1fr}}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
-  padding:16px}
-.card h2{font-size:13px;font-weight:650;text-transform:uppercase;
-  letter-spacing:.04em;color:var(--ink2);margin-bottom:10px}
-.item{padding:7px 0;border-top:1px solid var(--border);font-size:14px}
-.item:first-of-type{border-top:none}
-.item .meta{color:var(--ink2);font-size:12.5px}
-.chip{display:inline-block;border-radius:20px;padding:1px 9px;font-size:11.5px;
-  font-weight:600;background:var(--chip);color:var(--ink2)}
-.chip.high{background:var(--crit-bg);color:var(--crit)}
-.chip.medium{background:var(--warn-bg);color:var(--warn)}
-.chip.resolved{background:var(--good-bg);color:var(--good)}
-.bar-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;
-  padding:4px 0;font-size:13.5px}
-.bar-track{height:8px;border-radius:4px;background:var(--chip);margin-top:3px}
-.bar-fill{height:8px;border-radius:4px;background:var(--accent)}
-table{width:100%;border-collapse:collapse;font-size:13.5px}
-th{text-align:left;color:var(--ink2);font-size:12px;text-transform:uppercase;
-  letter-spacing:.04em;font-weight:600;padding:6px 10px 6px 0}
-td{padding:7px 10px 7px 0;border-top:1px solid var(--border);vertical-align:top}
-.foot{color:var(--ink2);font-size:12.5px;margin-top:16px}
-"""
-
-
-def _days_ago(ts):
-    try:
-        d = (datetime.now(timezone.utc)
-             - datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
-        return "today" if d <= 0 else ("1d ago" if d == 1 else f"{d}d ago")
-    except Exception:
-        return ""
+@app.get("/api/state")
+def api_state():
+    """Everything the Ops Board needs. Never includes sender_phone."""
+    recs = at_list(AT_LOG,
+                   formula="OR({status}='confirmed', {status}='resolved')",
+                   max_records=200, sort_desc_by="timestamp")
+    entries = []
+    for r in recs:
+        f = r["fields"]
+        entries.append({
+            "id": r["id"],
+            "ts": f.get("timestamp", ""),
+            "type": f.get("entry_type") or "observation",
+            "category": f.get("category", ""),
+            "urgency": f.get("urgency", ""),
+            "summary": f.get("summary") or f.get("raw_transcript", "")[:120],
+            "ask": f.get("the_ask", ""),
+            "impact": f.get("stated_impact", ""),
+            "status": f.get("status", ""),
+            "follow_up": bool(f.get("follow_up")),
+            "resolution": f.get("resolution_note", ""),
+            "raw": f.get("raw_transcript", "")[:400],
+        })
+    team = [{"name": r.get("name") or "—", "role": r.get("role", ""),
+             "alerts": r.get("alerts_for", "")}
+            for r in get_roster() if r.get("active")]
+    return {"at": now_iso(), "entries": entries, "team": team}
 
 
 @app.get("/dashboard")
 def dashboard():
-    recs = at_list(AT_LOG,
-                   formula="OR({status}='confirmed', {status}='resolved')",
-                   max_records=200, sort_desc_by="timestamp")
-    fields = [r["fields"] for r in recs]
-    roster = [r for r in get_roster() if r.get("active")]
-    e = escape
-
-    def etype(f):
-        return f.get("entry_type") or "observation"
-
-    open_f = [f for f in fields if f.get("status") == "confirmed"
-              and etype(f) not in ("completion", "knowledge")]
-    open_high = [f for f in open_f if f.get("urgency") == "high"]
-    resolved = [f for f in fields if f.get("status") == "resolved"]
-    follows = [f for f in open_f if f.get("follow_up")]
-    know = [f for f in fields if etype(f) == "knowledge"]
-
-    cats = {}
-    for f in open_f:
-        c = f.get("category") or "Other"
-        cats[c] = cats.get(c, 0) + 1
-    maxc = max(cats.values(), default=1)
-
-    def items(fs, empty, meta=lambda f: f.get("the_ask", "")):
-        if not fs:
-            return f'<div class="item meta" style="color:var(--ink2)">{empty}</div>'
-        return "".join(
-            f'<div class="item">{e(f.get("summary", ""))}'
-            f'<div class="meta">{e(meta(f) or "")} · {_days_ago(f.get("timestamp", ""))}</div></div>'
-            for f in fs[:6])
-
-    bars = "".join(
-        f'<div class="bar-row"><div>{e(c)}'
-        f'<div class="bar-track"><div class="bar-fill" style="width:{int(100 * n / maxc)}%"></div></div>'
-        f'</div><div>{n}</div></div>'
-        for c, n in sorted(cats.items(), key=lambda x: -x[1]))
-
-    team = "".join(
-        f'<div class="item">{e(r.get("name") or "—")}'
-        f'<div class="meta">{e(r.get("role") or "")}'
-        f'{" · alerts: " + e(r["alerts_for"]) if r.get("alerts_for") else ""}</div></div>'
-        for r in roster)
-
-    rows = "".join(
-        f'<tr><td>{_days_ago(f.get("timestamp", ""))}</td>'
-        f'<td>{e(etype(f))}</td><td>{e(f.get("category", ""))}</td>'
-        f'<td><span class="chip {e(f.get("urgency", ""))}">{e(f.get("urgency", "—"))}</span></td>'
-        f'<td>{e(f.get("summary", f.get("raw_transcript", ""))[:110])}</td>'
-        f'<td><span class="chip {e(f.get("status", ""))}">{e(f.get("status", ""))}</span></td></tr>'
-        for f in fields[:12])
-
-    html = f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="60"><title>OpsBrain — Ops Board</title>
-<style>{DASH_CSS}</style></head><body>
-<h1>OpsBrain — Ops Board</h1>
-<div class="sub">Live from the field log · refreshes every 60s · read-only
- (records &amp; routing rules are managed in Airtable)</div>
-<div class="tiles">
- <div class="tile"><div class="n">{len(open_f)}</div><div class="l">Open cases</div></div>
- <div class="tile"><div class="n">{len(open_high)}</div><div class="l">High urgency open</div></div>
- <div class="tile"><div class="n">{len(resolved)}</div><div class="l">Resolved</div></div>
- <div class="tile"><div class="n">{len(roster)}</div><div class="l">Active members</div></div>
-</div>
-<div class="cols">
- <div class="card"><h2>High urgency — needs action</h2>{items(open_high, "Nothing urgent open.")}</div>
- <div class="card"><h2>Open cases by category</h2>{bars or '<div class="item">No open cases.</div>'}</div>
-</div>
-<div class="cols">
- <div class="card"><h2>Check today (follow-ups)</h2>{items(follows, "No follow-ups flagged.")}</div>
- <div class="card"><h2>Standing notes (knowledge)</h2>{items(know, "None yet — texts like “from next time, everyone check X” land here.", meta=lambda f: f.get("category", ""))}</div>
-</div>
-<div class="card"><h2>Recent entries</h2>
-<div style="overflow-x:auto"><table>
-<tr><th>When</th><th>Type</th><th>Category</th><th>Urgency</th><th>Summary</th><th>Status</th></tr>
-{rows}</table></div></div>
-<div class="foot">Caller IDs are never shown. Roster &amp; routing (who gets
- alerted per category) are edited by the data steward directly in Airtable.</div>
-</body></html>"""
-    return Response(content=html, media_type="text/html")
+    from dashboard_html import DASH_HTML
+    return Response(content=DASH_HTML, media_type="text/html")
 
 
 @app.get("/debug/last")

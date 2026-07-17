@@ -17,7 +17,13 @@ Twilio (~$2/month + A2P registration) and flips one webhook URL; no code
 changes. We verified the Twilio path end-to-end up to the point where trial
 accounts block free-form replies (carrier/trial policy, not code).
 
-## Commands (from an approved phone)
+## Talking to it (from an approved phone)
+
+Staff write in **plain natural language** — "tell me what's going on today",
+"did anyone report the freezer door?", "three pallets of apples got spoiled,
+next shift check on it", "yea save that" — one Gemini call per message detects
+the intent (log / brief / lookup / confirm / discard / correction) and
+structures the entry. Exact commands below still work as instant fast-paths:
 
 | You send | You get |
 |---|---|
@@ -31,10 +37,12 @@ accounts block free-form replies (carrier/trial policy, not code).
 | `brief` | sectioned digest: HIGH / Check today / Done / New standing notes / Also logged |
 | `find <keyword>` | up to 3 matching entries (resolved ones marked), or exactly "No matching entries." |
 
-**Ops Board:** `GET /dashboard` — a read-only status page (open cases, high
-urgency, category breakdown, follow-ups, standing notes, recent entries, team).
-No login, no caller IDs, refreshes every 60s. Routing rules (`alerts_for` per
-roster member) and all records are edited in Airtable by the data steward.
+**Ops Board:** `GET /dashboard` — a live single-page board with a side menu
+(Overview / Cases / Follow-ups / Knowledge / Team), polling `GET /api/state`
+every 8s: stat tiles, category breakdown, search, urgency/status filters,
+click-to-expand case detail, new entries flash in as staff message the bot.
+No login, no caller IDs ever. Routing rules (`alerts_for` per roster member)
+and all records are edited in Airtable by the data steward.
 
 Numbers not on the Roster table get **no response at all**.
 

@@ -103,7 +103,7 @@ main{flex:1;padding:22px 26px;max-width:1000px}
 <script>
 const VIEWS=[["overview","Overview"],["cases","Cases"],["follow","Follow-ups"],
              ["know","Knowledge"],["team","Team"]];
-let S=null,view="overview",q="",fUrg="",fSt="",open={},known=null,cnt={};
+let S=null,view="overview",q="",fUrg="",fSt="",fRole="",open={},known=null,cnt={};
 const $=id=>document.getElementById(id);
 const esc=s=>(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function ago(ts){if(!ts)return"";const d=(Date.now()-new Date(ts))/864e5|0;
@@ -118,6 +118,7 @@ function go(k){view=k;render()}
 function tog(id){open[id]=!open[id];render()}
 function setU(v){fUrg=v;render()}
 function setS(v){fSt=v;render()}
+function setR(v){fRole=v;render()}
 function tile(n,l){return `<div class="tile"><div class="n">${n}</div><div class="l">${l}</div></div>`}
 function emp(t){return `<div class="empty">${t}</div>`}
 function row(e){
@@ -148,8 +149,13 @@ function vCases(){
  let es=S.entries.filter(e=>e.type!="knowledge").filter(match);
  if(fUrg)es=es.filter(e=>e.urgency==fUrg);
  if(fSt)es=es.filter(e=>e.status==fSt);
+ if(fRole){const ro=(S.roles||[]).find(r=>r.role==fRole);
+  const cats=(ro?ro.categories:"").toLowerCase();
+  es=es.filter(e=>e.category&&cats.includes(e.category.toLowerCase()))}
  const fb=(lbl,val,cur,fn)=>`<button class="fbtn ${cur==val?"act":""}" onclick="${fn}('${cur==val?"":val}')">${lbl}</button>`;
- return `<div class="filters">
+ const roleRow=(S.roles||[]).length?`<div class="filters"><span style="color:var(--ink2);font-size:12px">view as:</span>
+  ${(S.roles||[]).map(r=>fb(r.role,r.role,fRole,"setR")).join("")}</div>`:"";
+ return `${roleRow}<div class="filters">
   ${fb("high","high",fUrg,"setU")}${fb("medium","medium",fUrg,"setU")}${fb("low","low",fUrg,"setU")}
   <span style="width:10px"></span>
   ${fb("open","confirmed",fSt,"setS")}${fb("resolved","resolved",fSt,"setS")}</div>
@@ -162,8 +168,10 @@ function vKnow(){
  return `<div class="card"><h2>Standing notes</h2>${es.map(row).join("")||emp("No standing notes yet — messages like “from next time, everyone check X” land here.")}</div>`}
 function vTeam(){
  return `<div class="card"><h2>Active roster</h2>${S.team.map(t=>
-  `<div class="row" style="cursor:default">${esc(t.name)}<div class="m"><span>${esc(t.role)}</span>${t.alerts?`<span>·</span><span>alerts: ${esc(t.alerts)}</span>`:""}</div></div>`).join("")}</div>
- <div class="card"><h2>Routing rules</h2><div class="empty">Each member's “alerts” lists the categories they get pinged for; high urgency always alerts leads. The data steward edits these in Airtable → Roster → alerts_for.</div></div>`}
+  `<div class="row" style="cursor:default">${esc(t.name)}${t.high?" 🚨":""}<div class="m"><span class="chip f">${esc(t.role)||"no role"}</span>${t.alerts?`<span>gets: ${esc(t.alerts)}</span>`:""}</div></div>`).join("")}</div>
+ <div class="card"><h2>Roles</h2>${(S.roles||[]).map(r=>
+  `<div class="row" style="cursor:default">${esc(r.role)}${r.high?" 🚨 high-urgency alerts":""}<div class="m"><span>${esc(r.desc)}</span></div><div class="m"><span>covers: ${esc(r.categories)}</span></div></div>`).join("")||emp("No roles defined yet.")}</div>
+ <div class="card"><h2>How to change this</h2><div class="empty">Add a role = add a row in Airtable → Roles (name, categories it covers, high-urgency flag). Assign it by typing the role name on a member's Roster row. Members get alerts for their role's categories; per-member alerts_for adds extras on top.</div></div>`}
 function render(){
  if(!S)return;
  cnt={cases:S.entries.filter(isOpen).length,

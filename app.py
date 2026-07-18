@@ -47,6 +47,7 @@ AT_KEY = os.environ["AIRTABLE_API_KEY"]
 AT_BASE = os.environ["AIRTABLE_BASE_ID"]
 AT_LOG = os.environ.get("AIRTABLE_LOG_TABLE", "Log Entries")
 AT_ROSTER = os.environ.get("AIRTABLE_ROSTER_TABLE", "Roster")
+AT_ROLES = os.environ.get("AIRTABLE_ROLES_TABLE", "Roles")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 SELF_PING = os.environ.get("SELF_PING", "true").lower() == "true"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -123,6 +124,29 @@ def is_allowed(phone: str) -> bool:
 def lead_numbers():
     return [r["phone_number"] for r in get_roster()
             if r.get("active") and "lead" in (r.get("role") or "").lower()]
+
+
+_roles_cache = {"at": 0.0, "rows": []}
+
+
+def get_roles():
+    """Role definitions from the Roles table (name -> categories owned,
+    alert_on_high). Adding a role = adding a row there; tolerated if absent."""
+    try:
+        if time.time() - _roles_cache["at"] > 60:
+            rows = [r["fields"] for r in at_list(AT_ROLES, max_records=50)]
+            _roles_cache.update(at=time.time(), rows=rows)
+    except Exception:
+        log.warning("Roles table unavailable; falling back to alerts_for only")
+    return _roles_cache["rows"]
+
+
+def role_info(role_name):
+    rn = (role_name or "").strip().lower()
+    for r in get_roles():
+        if (r.get("role") or "").strip().lower() == rn:
+            return r
+    return {}
 
 # ---------------------------------------------------------------- Gemini
 
@@ -465,8 +489,11 @@ def handle_confirm(sender, whatsapp):
         addr = r.get("phone_number")
         if not (r.get("active") and addr) or addr == sender:
             continue
-        is_lead = "lead" in (r.get("role") or "").lower()
-        wants_cat = bool(cat) and cat.lower() in (r.get("alerts_for") or "").lower()
+        ri = role_info(r.get("role"))
+        watched = ((r.get("alerts_for") or "") + "," +
+                   (ri.get("categories") or "")).lower()
+        wants_cat = bool(cat) and cat.lower() in watched
+        is_lead = bool(ri.get("alert_on_high")) or "lead" in (r.get("role") or "").lower()
         if (high and is_lead) or wants_cat:
             recipients.add(addr)
     for addr in recipients:
@@ -823,10 +850,19 @@ def api_state():
             "resolution": f.get("resolution_note", ""),
             "raw": f.get("raw_transcript", "")[:400],
         })
-    team = [{"name": r.get("name") or "—", "role": r.get("role", ""),
-             "alerts": r.get("alerts_for", "")}
-            for r in get_roster() if r.get("active")]
-    return {"at": now_iso(), "entries": entries, "team": team}
+    team = []
+    for r in get_roster():
+        if not r.get("active"):
+            continue
+        ri = role_info(r.get("role"))
+        team.append({"name": r.get("name") or "—", "role": r.get("role", ""),
+                     "alerts": (r.get("alerts_for") or ri.get("categories") or ""),
+                     "high": bool(ri.get("alert_on_high"))
+                             or "lead" in (r.get("role") or "").lower()})
+    roles = [{"role": r.get("role", ""), "categories": r.get("categories", ""),
+              "high": bool(r.get("alert_on_high")),
+              "desc": r.get("description", "")} for r in get_roles()]
+    return {"at": now_iso(), "entries": entries, "team": team, "roles": roles}
 
 
 @app.get("/dashboard")
